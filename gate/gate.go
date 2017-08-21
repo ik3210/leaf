@@ -4,6 +4,7 @@ import (
 	"github.com/name5566/leaf/chanrpc"
 	"github.com/name5566/leaf/log"
 	"github.com/name5566/leaf/network"
+	"net"
 	"reflect"
 	"time"
 )
@@ -18,6 +19,8 @@ type Gate struct {
 	// websocket
 	WSAddr      string
 	HTTPTimeout time.Duration
+	CertFile    string
+	KeyFile     string
 
 	// tcp
 	TCPAddr      string
@@ -34,6 +37,8 @@ func (gate *Gate) Run(closeSig chan bool) {
 		wsServer.PendingWriteNum = gate.PendingWriteNum
 		wsServer.MaxMsgLen = gate.MaxMsgLen
 		wsServer.HTTPTimeout = gate.HTTPTimeout
+		wsServer.CertFile = gate.CertFile
+		wsServer.KeyFile = gate.KeyFile
 		wsServer.NewAgent = func(conn *network.WSConn) network.Agent {
 			a := &agent{conn: conn, gate: gate}
 			if gate.AgentChanRPC != nil {
@@ -109,7 +114,7 @@ func (a *agent) Run() {
 
 func (a *agent) OnClose() {
 	if a.gate.AgentChanRPC != nil {
-		err := a.gate.AgentChanRPC.Open(0).Call0("CloseAgent", a)
+		err := a.gate.AgentChanRPC.Call0("CloseAgent", a)
 		if err != nil {
 			log.Error("chanrpc error: %v", err)
 		}
@@ -123,12 +128,27 @@ func (a *agent) WriteMsg(msg interface{}) {
 			log.Error("marshal message %v error: %v", reflect.TypeOf(msg), err)
 			return
 		}
-		a.conn.WriteMsg(data...)
+		err = a.conn.WriteMsg(data...)
+		if err != nil {
+			log.Error("write message %v error: %v", reflect.TypeOf(msg), err)
+		}
 	}
+}
+
+func (a *agent) LocalAddr() net.Addr {
+	return a.conn.LocalAddr()
+}
+
+func (a *agent) RemoteAddr() net.Addr {
+	return a.conn.RemoteAddr()
 }
 
 func (a *agent) Close() {
 	a.conn.Close()
+}
+
+func (a *agent) Destroy() {
+	a.conn.Destroy()
 }
 
 func (a *agent) UserData() interface{} {

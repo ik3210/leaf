@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/name5566/leaf/conf"
+	"github.com/name5566/leaf/log"
 	"runtime"
 )
 
@@ -54,6 +55,14 @@ func NewServer(l int) *Server {
 	return s
 }
 
+func assert(i interface{}) []interface{} {
+	if i == nil {
+		return nil
+	} else {
+		return i.([]interface{})
+	}
+}
+
 // you must call the function before calling Open and Go
 func (s *Server) Register(id interface{}, f interface{}) {
 	switch f.(type) {
@@ -87,7 +96,7 @@ func (s *Server) ret(ci *CallInfo, ri *RetInfo) (err error) {
 	return
 }
 
-func (s *Server) Exec(ci *CallInfo) (err error) {
+func (s *Server) exec(ci *CallInfo) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if conf.LenStackBuf > 0 {
@@ -118,6 +127,13 @@ func (s *Server) Exec(ci *CallInfo) (err error) {
 	panic("bug")
 }
 
+func (s *Server) Exec(ci *CallInfo) {
+	err := s.exec(ci)
+	if err != nil {
+		log.Error("%v", err)
+	}
+}
+
 // goroutine safe
 func (s *Server) Go(id interface{}, args ...interface{}) {
 	f := s.functions[id]
@@ -135,6 +151,21 @@ func (s *Server) Go(id interface{}, args ...interface{}) {
 	}
 }
 
+// goroutine safe
+func (s *Server) Call0(id interface{}, args ...interface{}) error {
+	return s.Open(0).Call0(id, args...)
+}
+
+// goroutine safe
+func (s *Server) Call1(id interface{}, args ...interface{}) (interface{}, error) {
+	return s.Open(0).Call1(id, args...)
+}
+
+// goroutine safe
+func (s *Server) CallN(id interface{}, args ...interface{}) ([]interface{}, error) {
+	return s.Open(0).CallN(id, args...)
+}
+
 func (s *Server) Close() {
 	close(s.ChanCall)
 
@@ -147,11 +178,20 @@ func (s *Server) Close() {
 
 // goroutine safe
 func (s *Server) Open(l int) *Client {
+	c := NewClient(l)
+	c.Attach(s)
+	return c
+}
+
+func NewClient(l int) *Client {
 	c := new(Client)
-	c.s = s
 	c.chanSyncRet = make(chan *RetInfo, 1)
 	c.ChanAsynRet = make(chan *RetInfo, l)
 	return c
+}
+
+func (c *Client) Attach(s *Server) {
+	c.s = s
 }
 
 func (c *Client) call(ci *CallInfo, block bool) (err error) {
@@ -174,6 +214,11 @@ func (c *Client) call(ci *CallInfo, block bool) (err error) {
 }
 
 func (c *Client) f(id interface{}, n int) (f interface{}, err error) {
+	if c.s == nil {
+		err = errors.New("server not attached")
+		return
+	}
+
 	f = c.s.functions[id]
 	if f == nil {
 		err = fmt.Errorf("function id %v: function not registered", id)
@@ -252,13 +297,14 @@ func (c *Client) CallN(id interface{}, args ...interface{}) ([]interface{}, erro
 	}
 
 	ri := <-c.chanSyncRet
-	return ri.ret.([]interface{}), ri.err
+	return assert(ri.ret), ri.err
 }
 
-func (c *Client) asynCall(id interface{}, args []interface{}, cb interface{}, n int) error {
+func (c *Client) asynCall(id interface{}, args []interface{}, cb interface{}, n int) {
 	f, err := c.f(id, n)
 	if err != nil {
-		return err
+		c.ChanAsynRet <- &RetInfo{err: err, cb: cb}
+		return
 	}
 
 	err = c.call(&CallInfo{
@@ -268,11 +314,9 @@ func (c *Client) asynCall(id interface{}, args []interface{}, cb interface{}, n 
 		cb:      cb,
 	}, false)
 	if err != nil {
-		return err
+		c.ChanAsynRet <- &RetInfo{err: err, cb: cb}
+		return
 	}
-
-	c.pendingAsynCall++
-	return nil
 }
 
 func (c *Client) AsynCall(id interface{}, _args ...interface{}) {
@@ -280,52 +324,69 @@ func (c *Client) AsynCall(id interface{}, _args ...interface{}) {
 		panic("callback function not found")
 	}
 
-	// args
-	var args []interface{}
-	if len(_args) > 1 {
-		args = _args[:len(_args)-1]
-	}
-
-	// cb
+	args := _args[:len(_args)-1]
 	cb := _args[len(_args)-1]
+
+	var n int
 	switch cb.(type) {
 	case func(error):
-		err := c.asynCall(id, args, cb, 0)
-		if err != nil {
-			cb.(func(error))(err)
-		}
+		n = 0
 	case func(interface{}, error):
-		err := c.asynCall(id, args, cb, 1)
-		if err != nil {
-			cb.(func(interface{}, error))(nil, err)
-		}
+		n = 1
 	case func([]interface{}, error):
-		err := c.asynCall(id, args, cb, 2)
-		if err != nil {
-			cb.(func([]interface{}, error))(nil, err)
-		}
+		n = 2
 	default:
 		panic("definition of callback function is invalid")
 	}
+
+	// too many calls
+	if c.pendingAsynCall >= cap(c.ChanAsynRet) {
+		execCb(&RetInfo{err: errors.New("too many calls"), cb: cb})
+		return
+	}
+
+	c.asynCall(id, args, cb, n)
+	c.pendingAsynCall++
 }
 
-func (c *Client) Cb(ri *RetInfo) {
+func execCb(ri *RetInfo) {
+	defer func() {
+		if r := recover(); r != nil {
+			if conf.LenStackBuf > 0 {
+				buf := make([]byte, conf.LenStackBuf)
+				l := runtime.Stack(buf, false)
+				log.Error("%v: %s", r, buf[:l])
+			} else {
+				log.Error("%v", r)
+			}
+		}
+	}()
+
+	// execute
 	switch ri.cb.(type) {
 	case func(error):
 		ri.cb.(func(error))(ri.err)
 	case func(interface{}, error):
 		ri.cb.(func(interface{}, error))(ri.ret, ri.err)
 	case func([]interface{}, error):
-		ri.cb.(func([]interface{}, error))(ri.ret.([]interface{}), ri.err)
+		ri.cb.(func([]interface{}, error))(assert(ri.ret), ri.err)
 	default:
 		panic("bug")
 	}
+	return
+}
 
+func (c *Client) Cb(ri *RetInfo) {
 	c.pendingAsynCall--
+	execCb(ri)
 }
 
 func (c *Client) Close() {
 	for c.pendingAsynCall > 0 {
 		c.Cb(<-c.ChanAsynRet)
 	}
+}
+
+func (c *Client) Idle() bool {
+	return c.pendingAsynCall == 0
 }

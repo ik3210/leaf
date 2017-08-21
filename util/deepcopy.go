@@ -37,8 +37,13 @@ func deepCopy(dst, src reflect.Value) {
 			deepCopy(dst.Index(i), src.Index(i))
 		}
 	case reflect.Struct:
+		typeSrc := src.Type()
 		for i := 0; i < src.NumField(); i++ {
-			deepCopy(dst.Field(i), src.Field(i))
+			value := src.Field(i)
+			tag := typeSrc.Field(i).Tag
+			if value.CanSet() && tag.Get("deepcopy") != "-" {
+				deepCopy(dst.Field(i), value)
+			}
 		}
 	default:
 		dst.Set(src)

@@ -4,7 +4,6 @@ import (
 	"github.com/name5566/leaf/chanrpc"
 	"github.com/name5566/leaf/console"
 	"github.com/name5566/leaf/go"
-	"github.com/name5566/leaf/log"
 	"github.com/name5566/leaf/timer"
 	"time"
 )
@@ -12,9 +11,11 @@ import (
 type Skeleton struct {
 	GoLen              int
 	TimerDispatcherLen int
+	AsynCallLen        int
 	ChanRPCServer      *chanrpc.Server
 	g                  *g.Go
 	dispatcher         *timer.Dispatcher
+	client             *chanrpc.Client
 	server             *chanrpc.Server
 	commandServer      *chanrpc.Server
 }
@@ -26,9 +27,13 @@ func (s *Skeleton) Init() {
 	if s.TimerDispatcherLen <= 0 {
 		s.TimerDispatcherLen = 0
 	}
+	if s.AsynCallLen <= 0 {
+		s.AsynCallLen = 0
+	}
 
 	s.g = g.New(s.GoLen)
 	s.dispatcher = timer.NewDispatcher(s.TimerDispatcherLen)
+	s.client = chanrpc.NewClient(s.AsynCallLen)
 	s.server = s.ChanRPCServer
 
 	if s.server == nil {
@@ -43,18 +48,17 @@ func (s *Skeleton) Run(closeSig chan bool) {
 		case <-closeSig:
 			s.commandServer.Close()
 			s.server.Close()
-			s.g.Close()
+			for !s.g.Idle() || !s.client.Idle() {
+				s.g.Close()
+				s.client.Close()
+			}
 			return
+		case ri := <-s.client.ChanAsynRet:
+			s.client.Cb(ri)
 		case ci := <-s.server.ChanCall:
-			err := s.server.Exec(ci)
-			if err != nil {
-				log.Error("%v", err)
-			}
+			s.server.Exec(ci)
 		case ci := <-s.commandServer.ChanCall:
-			err := s.commandServer.Exec(ci)
-			if err != nil {
-				log.Error("%v", err)
-			}
+			s.commandServer.Exec(ci)
 		case cb := <-s.g.ChanCb:
 			s.g.Cb(cb)
 		case t := <-s.dispatcher.ChanTimer:
@@ -71,12 +75,12 @@ func (s *Skeleton) AfterFunc(d time.Duration, cb func()) *timer.Timer {
 	return s.dispatcher.AfterFunc(d, cb)
 }
 
-func (s *Skeleton) CronFunc(expr string, cb func()) (*timer.Cron, error) {
+func (s *Skeleton) CronFunc(cronExpr *timer.CronExpr, cb func()) *timer.Cron {
 	if s.TimerDispatcherLen == 0 {
 		panic("invalid TimerDispatcherLen")
 	}
 
-	return s.dispatcher.CronFunc(expr, cb)
+	return s.dispatcher.CronFunc(cronExpr, cb)
 }
 
 func (s *Skeleton) Go(f func(), cb func()) {
@@ -93,6 +97,15 @@ func (s *Skeleton) NewLinearContext() *g.LinearContext {
 	}
 
 	return s.g.NewLinearContext()
+}
+
+func (s *Skeleton) AsynCall(server *chanrpc.Server, id interface{}, args ...interface{}) {
+	if s.AsynCallLen == 0 {
+		panic("invalid AsynCallLen")
+	}
+
+	s.client.Attach(server)
+	s.client.AsynCall(id, args...)
 }
 
 func (s *Skeleton) RegisterChanRPC(id interface{}, f interface{}) {
